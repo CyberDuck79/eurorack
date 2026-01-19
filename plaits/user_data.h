@@ -31,7 +31,46 @@
 
 #include "stmlib/stmlib.h"
 
-#ifdef TEST
+#ifdef PLAITS_DAISY
+// Daisy platform: Use external user data provider (SD card based)
+// The UserDataProvider is set by the main application
+
+namespace plaits {
+
+// Interface for user data provider
+class UserDataProvider {
+ public:
+  virtual const uint8_t* ptr(int slot) const = 0;
+};
+
+// Global pointer to user data provider (set by application)
+extern UserDataProvider* g_user_data_provider;
+
+class UserData {
+ public:
+  enum {
+    SIZE = 0x1000  // 4096 bytes per target
+  };
+
+  UserData() { }
+  ~UserData() { }
+
+  inline const uint8_t* ptr(int slot) const {
+    if (g_user_data_provider) {
+      return g_user_data_provider->ptr(slot);
+    }
+    return NULL;
+  }
+  
+  // Save not supported on Daisy (use SD card tools instead)
+  inline bool Save(uint8_t* rx_buffer, int slot) {
+    return false;
+  }
+};
+
+}  // namespace plaits
+
+#elif defined(TEST)
 
 // Mock flash saving functions for debugging purposes.
 #define PAGE_SIZE 0x800
@@ -54,13 +93,6 @@ inline void FLASH_ProgramWord(uint32_t address, uint32_t word) {
   }
 }
 
-#else
-
-#include <stm32f37x_conf.h>
-#include "stmlib/system/flash_programming.h"
-
-#endif  // TEST
-
 namespace plaits {
 
 class UserData {
@@ -73,20 +105,9 @@ class UserData {
   UserData() { }
   ~UserData() { }
 
-#ifdef TEST  
   inline const uint8_t* ptr(int slot) const {
     return NULL;
   }
-#else
-  inline const uint8_t* ptr(int slot) const {
-    const uint8_t* data = (const uint8_t*)(ADDRESS);
-    if (data[SIZE - 2] == 'U' && data[SIZE - 1] == (' ' + slot)) {
-      return data;
-    } else {
-      return NULL;
-    }
-  }
-#endif  // TEST
   
   inline bool Save(uint8_t* rx_buffer, int slot) {
     if (slot < rx_buffer[SIZE - 2] || slot > rx_buffer[SIZE - 1]) {
@@ -112,5 +133,58 @@ class UserData {
 };
 
 }  // namespace plaits
+
+#else  // Original STM32F37x hardware
+
+#include <stm32f37x_conf.h>
+#include "stmlib/system/flash_programming.h"
+
+namespace plaits {
+
+class UserData {
+ public:
+  enum {
+    ADDRESS = 0x08007000,
+    SIZE = 0x1000
+  };
+
+  UserData() { }
+  ~UserData() { }
+
+  inline const uint8_t* ptr(int slot) const {
+    const uint8_t* data = (const uint8_t*)(ADDRESS);
+    if (data[SIZE - 2] == 'U' && data[SIZE - 1] == (' ' + slot)) {
+      return data;
+    } else {
+      return NULL;
+    }
+  }
+  
+  inline bool Save(uint8_t* rx_buffer, int slot) {
+    if (slot < rx_buffer[SIZE - 2] || slot > rx_buffer[SIZE - 1]) {
+      return false;
+    }
+    
+    // Tag the data to identify which engine it should be associated to.
+    rx_buffer[SIZE - 2] = 'U';
+    rx_buffer[SIZE - 1] = ' ' + slot;
+
+    // Write to FLASH.
+    const uint32_t* words = static_cast<const uint32_t*>(
+        static_cast<const void*>(rx_buffer));
+    for (uint32_t i = ADDRESS; i < ADDRESS + SIZE; i += 4) {
+      if (i % PAGE_SIZE == 0) {
+        FLASH_Unlock();
+        FLASH_ErasePage(i);
+      }
+      FLASH_ProgramWord(i, *words++);
+    }
+    return true;
+  }
+};
+
+}  // namespace plaits
+
+#endif  // PLAITS_DAISY / TEST / hardware
 
 #endif  // PLAITS_USER_DATA_H_

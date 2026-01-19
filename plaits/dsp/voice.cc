@@ -29,6 +29,8 @@
 #include "plaits/dsp/voice.h"
 #include "plaits/user_data.h"
 
+#include <algorithm>
+
 namespace plaits {
 
 using namespace std;
@@ -77,12 +79,17 @@ void Voice::Init(BufferAllocator* allocator) {
   
   out_post_processor_.Init();
   aux_post_processor_.Init();
+  out_dry_post_processor_.Init();
+  aux_dry_post_processor_.Init();
 
   decay_envelope_.Init();
   lpg_envelope_.Init();
   
   trigger_state_ = false;
   previous_note_ = 0.0f;
+  
+  // Warps Lite FM phase
+  fm_phase_ = 0.0f;
   
   trigger_delay_.Init(trigger_delay_line_);
 }
@@ -227,6 +234,38 @@ void Voice::Render(
   bool already_enveloped = pp_s.already_enveloped;
   e->Render(p, out_buffer_, aux_buffer_, size, &already_enveloped);
   
+  // Copy dry buffers before audio modulation
+  std::copy(out_buffer_, out_buffer_ + size, out_buffer_dry_);
+  std::copy(aux_buffer_, aux_buffer_ + size, aux_buffer_dry_);
+  
+  // Apply Warps Lite dual-stage audio modulation to wet buffers
+  // Stage 1 (IN1): 7 algorithms (no Vocoder)
+  if (modulations.audio_mod_in1 && modulations.audio_mod_mode1 > 0) {
+    ApplyAudioModulation(
+        out_buffer_, aux_buffer_,
+        modulations.audio_mod_in1,
+        modulations.audio_mod_mode1,
+        modulations.audio_mod_gain1,
+        modulations.audio_mod_level1,
+        modulations.audio_mod_timbre1,
+        size,
+        false);  // No Vocoder in Stage 1
+  }
+  
+  // Stage 2 (IN2): 8 algorithms (with Vocoder)
+  // Processes the output of Stage 1 (chained)
+  if (modulations.audio_mod_in2 && modulations.audio_mod_mode2 > 0) {
+    ApplyAudioModulation(
+        out_buffer_, aux_buffer_,
+        modulations.audio_mod_in2,
+        modulations.audio_mod_mode2,
+        modulations.audio_mod_gain2,
+        modulations.audio_mod_level2,
+        modulations.audio_mod_timbre2,
+        size,
+        true);  // Vocoder allowed in Stage 2
+  }
+  
   bool lpg_bypass = already_enveloped || \
       (!modulations.level_patched && !modulations.trigger_patched);
   
@@ -246,6 +285,7 @@ void Voice::Render(
     lpg_envelope_.Init();
   }
   
+  // Process wet outputs (with audio modulation) through LPG
   out_post_processor_.Process(
       pp_s.out_gain,
       lpg_bypass,
@@ -255,7 +295,7 @@ void Voice::Render(
       out_buffer_,
       &frames->out,
       size,
-      2);
+      4);  // stride=4 for Frame with 4 shorts
 
   aux_post_processor_.Process(
       pp_s.aux_gain,
@@ -266,7 +306,212 @@ void Voice::Render(
       aux_buffer_,
       &frames->aux,
       size,
-      2);
+      4);  // stride=4 for Frame with 4 shorts
+      
+  // Process dry outputs (no audio modulation) through LPG
+  out_dry_post_processor_.Process(
+      pp_s.out_gain,
+      lpg_bypass,
+      lpg_envelope_.gain(),
+      lpg_envelope_.frequency(),
+      lpg_envelope_.hf_bleed(),
+      out_buffer_dry_,
+      &frames->out_dry,
+      size,
+      4);  // stride=4 for Frame with 4 shorts
+
+  aux_dry_post_processor_.Process(
+      pp_s.aux_gain,
+      lpg_bypass,
+      lpg_envelope_.gain(),
+      lpg_envelope_.frequency(),
+      lpg_envelope_.hf_bleed(),
+      aux_buffer_dry_,
+      &frames->aux_dry,
+      size,
+      4);  // stride=4 for Frame with 4 shorts
+}
+
+// Warps Lite helper: Diode non-linearity for analog ring mod
+static inline float Diode(float x) {
+  float sign = x > 0.0f ? 1.0f : -1.0f;
+  float dead_zone = std::fabs(x) - 0.667f;
+  dead_zone += std::fabs(dead_zone);
+  dead_zone *= dead_zone;
+  return 0.04324765822726063f * dead_zone * sign;
+}
+
+// Warps Lite helper: Soft limiting
+static inline float SoftLimit(float x) {
+  return x / (1.0f + std::fabs(x));
+}
+
+// Warps Lite helper: Bipolar fold (approximation without LUT)
+static inline float BipolarFold(float x) {
+  // Simple folding: wrap into -1..1 range with folding
+  const float kRange = 4.0f;
+  x = std::fmod(x + kRange, kRange * 2.0f) - kRange;
+  if (x > 1.0f) x = 2.0f - x;
+  if (x < -1.0f) x = -2.0f - x;
+  return x;
+}
+
+void Voice::ApplyAudioModulation(
+    float* out, float* aux,
+    const float* mod_in,
+    int mode, float gain, float level, float timbre,
+    size_t size,
+    bool allow_vocoder) {
+  
+  // For Vocoder mode, we need to check if it's allowed (Stage 2 only)
+  if (mode == 8 && !allow_vocoder) {
+    return;  // Vocoder not allowed in Stage 1
+  }
+  
+  for (size_t i = 0; i < size; i++) {
+    // Apply gain (preamp) and level (modulator amount) to the modulator
+    float mod = mod_in[i] * gain * level;
+    float carrier = out[i];
+    float carrier_aux = aux[i];
+    float result = carrier;
+    float result_aux = carrier_aux;
+    
+    switch (mode) {
+      case 1:  // XFADE - Crossfade between synth and external
+        {
+          // Timbre controls crossfade curve (linear to equal-power-ish)
+          float fade = timbre;
+          result = carrier * (1.0f - fade) + mod * fade;
+          result_aux = carrier_aux * (1.0f - fade) + mod * fade;
+        }
+        break;
+        
+      case 2:  // FOLD - Wavefolding
+        {
+          float sum = carrier + mod + carrier * mod * 0.25f;
+          sum *= (0.02f + timbre);  // Timbre controls fold amount
+          result = BipolarFold(sum * 4.0f);
+          
+          float sum_aux = carrier_aux + mod + carrier_aux * mod * 0.25f;
+          sum_aux *= (0.02f + timbre);
+          result_aux = BipolarFold(sum_aux * 4.0f);
+        }
+        break;
+        
+      case 3:  // AnaRM - Analog Ring Modulation (diode-based)
+        {
+          float c = carrier * 2.0f;
+          float ring = Diode(mod + c) + Diode(mod - c);
+          ring *= (4.0f + timbre * 24.0f);
+          result = SoftLimit(ring);
+          
+          float c_aux = carrier_aux * 2.0f;
+          float ring_aux = Diode(mod + c_aux) + Diode(mod - c_aux);
+          ring_aux *= (4.0f + timbre * 24.0f);
+          result_aux = SoftLimit(ring_aux);
+        }
+        break;
+        
+      case 4:  // DigRM - Digital Ring Modulation
+        {
+          float ring = 4.0f * carrier * mod * (1.0f + timbre * 8.0f);
+          result = ring / (1.0f + std::fabs(ring));
+          
+          float ring_aux = 4.0f * carrier_aux * mod * (1.0f + timbre * 8.0f);
+          result_aux = ring_aux / (1.0f + std::fabs(ring_aux));
+        }
+        break;
+        
+      case 5:  // XOR - Bitwise XOR
+        {
+          int16_t c_short = static_cast<int16_t>(std::clamp(carrier * 32768.0f, -32768.0f, 32767.0f));
+          int16_t m_short = static_cast<int16_t>(std::clamp(mod * 32768.0f, -32768.0f, 32767.0f));
+          float xor_result = static_cast<float>(c_short ^ m_short) / 32768.0f;
+          float sum = (carrier + mod) * 0.7f;
+          result = sum + (xor_result - sum) * timbre;
+          
+          int16_t ca_short = static_cast<int16_t>(std::clamp(carrier_aux * 32768.0f, -32768.0f, 32767.0f));
+          float xor_aux = static_cast<float>(ca_short ^ m_short) / 32768.0f;
+          float sum_aux = (carrier_aux + mod) * 0.7f;
+          result_aux = sum_aux + (xor_aux - sum_aux) * timbre;
+        }
+        break;
+        
+      case 6:  // COMP - Comparator modes
+        {
+          // Timbre selects between: min, threshold, max, abs-max
+          float x = timbre * 2.995f;
+          int x_int = static_cast<int>(x);
+          float x_frac = x - x_int;
+          
+          float direct = mod < carrier ? mod : carrier;
+          float window = std::fabs(mod) > std::fabs(carrier) ? mod : carrier;
+          float threshold = carrier > 0.05f ? carrier : mod;
+          float window_2 = std::fabs(mod) > std::fabs(carrier) ? std::fabs(mod) : -std::fabs(carrier);
+          
+          float seq[4] = { direct, threshold, window, window_2 };
+          result = seq[x_int] + (seq[std::min(x_int + 1, 3)] - seq[x_int]) * x_frac;
+          
+          // Simplified for aux
+          float direct_aux = mod < carrier_aux ? mod : carrier_aux;
+          float window_aux = std::fabs(mod) > std::fabs(carrier_aux) ? mod : carrier_aux;
+          float threshold_aux = carrier_aux > 0.05f ? carrier_aux : mod;
+          float window_2_aux = std::fabs(mod) > std::fabs(carrier_aux) ? std::fabs(mod) : -std::fabs(carrier_aux);
+          
+          float seq_aux[4] = { direct_aux, threshold_aux, window_aux, window_2_aux };
+          result_aux = seq_aux[x_int] + (seq_aux[std::min(x_int + 1, 3)] - seq_aux[x_int]) * x_frac;
+        }
+        break;
+        
+      case 7:  // FM - Phase Modulation (true FM)
+        {
+          // Use modulator to modulate the phase of a simple oscillator
+          // that then ring-modulates with the carrier
+          // Timbre controls modulation depth
+          fm_phase_ += 0.01f + mod * timbre * 0.5f;
+          if (fm_phase_ >= 1.0f) fm_phase_ -= 1.0f;
+          if (fm_phase_ < 0.0f) fm_phase_ += 1.0f;
+          
+          // Simple sine approximation: 4x(x - x^2) for x in 0..1
+          float phase = fm_phase_;
+          float sine = phase < 0.5f 
+              ? 8.0f * phase * (0.5f - phase)
+              : -8.0f * (phase - 0.5f) * (1.0f - phase);
+          
+          // Ring modulate carrier with the FM sine
+          result = carrier * sine;
+          result_aux = carrier_aux * sine;
+        }
+        break;
+        
+      case 8:  // VOCODER - Simple vocoder effect (Stage 2 only)
+        {
+          // Simplified vocoder: use envelope follower on modulator
+          // to modulate carrier amplitude and add formant character
+          // This is a simplified version - real Warps vocoder is much more complex
+          float mod_env = std::fabs(mod);
+          
+          // Timbre controls formant emphasis (more high freq content)
+          float formant = 1.0f + timbre * 2.0f;
+          
+          // Simple formant-like filtering via nonlinearity
+          float shaped = mod * (1.0f + std::fabs(mod) * formant);
+          
+          // Apply modulator envelope to carrier
+          result = carrier * (0.2f + mod_env * 0.8f) + shaped * 0.3f;
+          result_aux = carrier_aux * (0.2f + mod_env * 0.8f) + shaped * 0.3f;
+          
+          // Soft limit
+          result = SoftLimit(result * 2.0f);
+          result_aux = SoftLimit(result_aux * 2.0f);
+        }
+        break;
+    }
+    
+    // Output the result directly (level already controls modulator contribution)
+    out[i] = result;
+    aux[i] = result_aux;
+  }
 }
   
 }  // namespace plaits

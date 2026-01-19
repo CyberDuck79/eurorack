@@ -151,6 +151,26 @@ struct Modulations {
   bool morph_patched;
   bool trigger_patched;
   bool level_patched;
+  
+  // Warps Lite dual-stage audio modulation (optional, for Daisy Patch port)
+  // Set audio_mod_in to nullptr to disable that stage
+  // Stage 1 modes: 0=OFF, 1=XFADE, 2=FOLD, 3=AnaRM, 4=DigRM, 5=XOR, 6=COMP, 7=FM
+  // Stage 2 modes: 0=OFF, 1=XFADE, 2=FOLD, 3=AnaRM, 4=DigRM, 5=XOR, 6=COMP, 7=FM, 8=VOCODER
+  // Signal flow: Plaits -> Stage1(IN1) -> Stage2(IN2) -> wet out
+  
+  // Stage 1 (IN1) - 7 algorithms (no Vocoder)
+  const float* audio_mod_in1;   // Pointer to modulation input buffer (Audio In 1)
+  int audio_mod_mode1;          // Algorithm selection
+  float audio_mod_gain1;        // 1.0 to 10.0 (input preamp for weak signals)
+  float audio_mod_level1;       // 0.0 to 1.0 (modulator level into algorithm)
+  float audio_mod_timbre1;      // 0.0 to 1.0 (algorithm-specific parameter)
+  
+  // Stage 2 (IN2) - 8 algorithms (includes Vocoder)
+  const float* audio_mod_in2;   // Pointer to modulation input buffer (Audio In 2)
+  int audio_mod_mode2;          // Algorithm selection
+  float audio_mod_gain2;        // 1.0 to 10.0 (input preamp for weak signals)
+  float audio_mod_level2;       // 0.0 to 1.0 (modulator level into algorithm)
+  float audio_mod_timbre2;      // 0.0 to 1.0 (algorithm-specific parameter)
 };
 
 // char (*__foo)[sizeof(HiHatEngine)] = 1;
@@ -164,6 +184,8 @@ class Voice {
   struct Frame {
     short out;
     short aux;
+    short out_dry;  // Dry output (no audio modulation applied)
+    short aux_dry;  // Dry aux (no audio modulation applied)
   };
   
   void Init(stmlib::BufferAllocator* allocator);
@@ -176,6 +198,9 @@ class Voice {
       Frame* frames,
       size_t size);
   inline int active_engine() const { return previous_engine_index_; }
+  
+  // Get LPG envelope gain for CV output (0.0 to 1.0)
+  inline float GetLPGGain() const { return lpg_envelope_.gain(); }
     
  private:
   void ComputeDecayParameters(const Patch& settings);
@@ -244,11 +269,27 @@ class Voice {
   
   ChannelPostProcessor out_post_processor_;
   ChannelPostProcessor aux_post_processor_;
+  ChannelPostProcessor out_dry_post_processor_;
+  ChannelPostProcessor aux_dry_post_processor_;
   
   EngineRegistry<kMaxEngines> engines_;
   
   float out_buffer_[kMaxBlockSize];
   float aux_buffer_[kMaxBlockSize];
+  float out_buffer_dry_[kMaxBlockSize];
+  float aux_buffer_dry_[kMaxBlockSize];
+  
+  // Warps Lite phase modulator state
+  float fm_phase_;
+  
+  // Apply Warps Lite audio modulation to wet buffers
+  // Stage 1: 7 algorithms (no Vocoder), Stage 2: 8 algorithms (with Vocoder)
+  void ApplyAudioModulation(
+      float* out, float* aux,
+      const float* mod_in,
+      int mode, float gain, float level, float timbre,
+      size_t size,
+      bool allow_vocoder);
   
   DISALLOW_COPY_AND_ASSIGN(Voice);
 };

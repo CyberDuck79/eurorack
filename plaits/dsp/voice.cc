@@ -159,10 +159,16 @@ void Voice::Render(
     p.trigger = TRIGGER_UNPATCHED;
   }
   
-  const float short_decay = (200.0f * kBlockSize) / kSampleRate *
+  // Use reference block size (24) for consistent decay timing regardless of actual block size
+  const float short_decay = (200.0f * 24.0f) / kSampleRate *
       SemitonesToRatio(-96.0f * patch.decay);
 
-  decay_envelope_.Process(short_decay * 2.0f);
+  // Process envelope multiple times to compensate for larger block sizes
+  // Original code assumed 24-sample blocks, so we need to process kMaxBlockSize/24 times
+  const int envelope_updates = kMaxBlockSize / 24;
+  for (int i = 0; i < envelope_updates; ++i) {
+    decay_envelope_.Process(short_decay * 2.0f);
+  }
 
   float compressed_level = 1.3f * modulations.level / (0.3f + fabsf(modulations.level));
   CONSTRAIN(compressed_level, 0.0f, 1.0f);
@@ -272,13 +278,15 @@ void Voice::Render(
   // Compute LPG parameters.
   if (!lpg_bypass) {
     const float hf = patch.lpg_colour;
-    const float decay_tail = (20.0f * kBlockSize) / kSampleRate *
+    // Use reference block size (24) for consistent decay timing
+    const float decay_tail = (20.0f * 24.0f) / kSampleRate *
         SemitonesToRatio(-72.0f * patch.decay + 12.0f * hf) - short_decay;
     
     if (modulations.level_patched) {
       lpg_envelope_.ProcessLP(compressed_level, short_decay, decay_tail, hf);
     } else {
-      const float attack = NoteToFrequency(p.note) * float(kBlockSize) * 2.0f;
+      // Use reference block size (24) for consistent attack timing
+      const float attack = NoteToFrequency(p.note) * 24.0f * 2.0f;
       lpg_envelope_.ProcessPing(attack, short_decay, decay_tail, hf);
     }
   } else {

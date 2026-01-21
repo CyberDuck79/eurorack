@@ -201,6 +201,9 @@ class Voice {
   
   // Get LPG envelope gain for CV output (0.0 to 1.0)
   inline float GetLPGGain() const { return lpg_envelope_.gain(); }
+  
+  // Get internal decay envelope value (0.0 to 1.0) - for polyphonic voice management
+  inline float GetDecayEnvelope() const { return decay_envelope_.value(); }
     
  private:
   void ComputeDecayParameters(const Patch& settings);

@@ -45,6 +45,11 @@ const int kNumCustomWaves = 15;
 const size_t kTableSize = 128;
 const float kTableSizeF = float(kTableSize);
 
+// Static storage for wave_map_ to persist across engine switches
+// (the BufferAllocator reuses memory between engines, so dynamic allocation
+// would cause wave_map_ to be overwritten by other engines)
+static const int16_t* static_wave_map[kNumBanks * kNumWavesPerBank];
+
 void WavetableEngine::Init(BufferAllocator* allocator) {
   phase_ = 0.0f;
 
@@ -63,7 +68,9 @@ void WavetableEngine::Init(BufferAllocator* allocator) {
 
   diff_out_.Init();
   
-  wave_map_ = allocator->Allocate<const int16_t*>(kNumWavesPerBank);
+  // Use static storage for wave_map_ instead of allocator
+  // This ensures the wave map persists across engine switches
+  wave_map_ = static_wave_map;
 }
 
 void WavetableEngine::Reset() {
@@ -83,7 +90,8 @@ void WavetableEngine::LoadUserData(const uint8_t* user_data) {
       const int16_t* base = wav_integrated_waves;
       if (w >= kNumWaves) {
         base = (const int16_t*)(user_data + 64);
-        w = min(w - kNumWaves, kNumCustomWaves);
+        // Custom wave indices are 0 to kNumCustomWaves-1 (0-14)
+        w = min(w - kNumWaves, kNumCustomWaves - 1);
       }
       wave_map_[i] = base + size_t(w) * (kTableSize + 4);
     }
@@ -104,8 +112,11 @@ inline float WavetableEngine::ReadWave(
     int z,
     int phase_integral,
     float phase_fractional) {
+  int idx = x + y * 8 + z * kNumWavesPerBank;
+  const int16_t* wave = wave_map_[idx];
+  
   return InterpolateWaveHermite(
-      wave_map_[x + y * 8 + z * kNumWavesPerBank],
+      wave,
       phase_integral,
       phase_fractional);
 }

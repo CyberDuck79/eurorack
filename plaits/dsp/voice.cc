@@ -132,7 +132,26 @@ void Voice::Render(
   
   Engine* e = engines_.get(engine_index);
   
-  if (engine_index != previous_engine_index_ || reload_user_data_) {
+  // When reload_user_data_ is set, we need to reload ALL engines that use
+  // user data, not just the current one. This ensures that loading a wavetable
+  // while on a different engine still works when switching to the wavetable engine.
+  if (reload_user_data_) {
+    UserData user_data;
+    // Engines with user data: 2-4 (six_op FM banks), 5 (wave terrain), 13 (wavetable)
+    static const int user_data_engines[] = {2, 3, 4, 5, 13};
+    for (int i = 0; i < 5; ++i) {
+      int idx = user_data_engines[i];
+      const uint8_t* data = user_data.ptr(idx);
+      // Fall back to built-in FM patches if no user data for engines 2-4
+      if (!data && idx >= 2 && idx <= 4) {
+        data = fm_patches_table[idx - 2];
+      }
+      engines_.get(idx)->LoadUserData(data);
+    }
+    reload_user_data_ = false;
+  }
+  
+  if (engine_index != previous_engine_index_) {
     UserData user_data;
     const uint8_t* data = user_data.ptr(engine_index);
     if (!data && engine_index >= 2 && engine_index <= 4) {
@@ -143,7 +162,6 @@ void Voice::Render(
 
     out_post_processor_.Reset();
     previous_engine_index_ = engine_index;
-    reload_user_data_ = false;
   }
   EngineParameters p;
 

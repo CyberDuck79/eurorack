@@ -137,11 +137,13 @@ void Voice::Render(
   // while on a different engine still works when switching to the wavetable engine.
   if (reload_user_data_) {
     UserData user_data;
+    
     // Engines with user data: 2-4 (six_op FM banks), 5 (wave terrain), 13 (wavetable)
     static const int user_data_engines[] = {2, 3, 4, 5, 13};
     for (int i = 0; i < 5; ++i) {
       int idx = user_data_engines[i];
       const uint8_t* data = user_data.ptr(idx);
+      
       // Fall back to built-in FM patches if no user data for engines 2-4
       if (!data && idx >= 2 && idx <= 4) {
         data = fm_patches_table[idx - 2];

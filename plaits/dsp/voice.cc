@@ -132,24 +132,31 @@ void Voice::Render(
   
   Engine* e = engines_.get(engine_index);
   
-  // When reload_user_data_ is set, we need to reload ALL engines that use
-  // user data, not just the current one. This ensures that loading a wavetable
-  // while on a different engine still works when switching to the wavetable engine.
+  // When reload_user_data_ is set, we need to reload user data for engines.
+  // IMPORTANT: Engines 2, 3, 4 share the SAME six_op_engine_ instance!
+  // We must only load the data for the CURRENT engine index, not all three,
+  // otherwise the last one (bank 3) always wins.
+  // Other engines (5=wave_terrain, 13=wavetable) have unique instances.
   if (reload_user_data_) {
     UserData user_data;
     
-    // Engines with user data: 2-4 (six_op FM banks), 5 (wave terrain), 13 (wavetable)
-    static const int user_data_engines[] = {2, 3, 4, 5, 13};
-    for (int i = 0; i < 5; ++i) {
-      int idx = user_data_engines[i];
+    // Load data for unique engine instances (wave terrain, wavetable)
+    // These can be loaded regardless of current engine since they're separate instances
+    static const int unique_user_data_engines[] = {5, 13};
+    for (int i = 0; i < 2; ++i) {
+      int idx = unique_user_data_engines[i];
       const uint8_t* data = user_data.ptr(idx);
-      
-      // Fall back to built-in FM patches if no user data for engines 2-4
-      if (!data && idx >= 2 && idx <= 4) {
-        data = fm_patches_table[idx - 2];
-      }
       engines_.get(idx)->LoadUserData(data);
     }
+    
+    // For the current engine (including shared FM engines), load its specific data
+    const uint8_t* data = user_data.ptr(engine_index);
+    if (!data && engine_index >= 2 && engine_index <= 4) {
+      data = fm_patches_table[engine_index - 2];
+    }
+    e->LoadUserData(data);
+    e->Reset();
+    
     reload_user_data_ = false;
   }
   
